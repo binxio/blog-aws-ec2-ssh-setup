@@ -1,0 +1,237 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: aws-ec2-ssh-setup
+Mappings:
+  SubnetConfig:
+    VPC:
+      CIDR: '10.0.0.0/16'
+    Public:
+      CIDR: '10.0.0.0/24'
+    Private:
+      CIDR: '10.0.1.0/24'
+  NatAMI:
+    eu-west-1:
+      ami: 'ami-024107e3e3217a248'
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      CidrBlock: !FindInMap ['SubnetConfig', 'VPC', 'CIDR']
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+         Fn::Select:
+         - 0
+         - Fn::GetAZs: {Ref: 'AWS::Region'}
+      VpcId: !Ref VPC
+      CidrBlock: !FindInMap ['SubnetConfig', 'Public', 'CIDR']
+      MapPublicIpOnLaunch: true
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  GatewayAttachement:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachement
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+         Fn::Select:
+         - 0
+         - Fn::GetAZs: {Ref: 'AWS::Region'}
+      VpcId: !Ref VPC
+      CidrBlock: !FindInMap ['SubnetConfig', 'Private', 'CIDR']
+      MapPublicIpOnLaunch: true
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  BastionHost:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !FindInMap ['NatAMI', 'eu-west-1', 'ami']
+      KeyName: BastionKeyPair
+      InstanceType: 't3.micro'
+      SourceDestCheck: false
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref BastionHostSecurityGroup
+      IamInstanceProfile: !Ref BastionInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvdcz
+          Ebs:
+            VolumeType: gp2
+            VolumeSize: 10
+            DeleteOnTermination: true
+            Encrypted: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          export AWS_DEFAULT_REGION=eu-west-1
+          yum install -y https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/linux_amd64/amazon-ssm-agent.rpm
+
+  BastionInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref BastionRole
+
+  BastionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM'
+        - 'arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser'
+      Policies:
+        - PolicyName: gitlab-runner
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/bastion/default/*'
+
+  BastionHostSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Security group for the bastion host'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+
+  PrivateKey:
+    Type: Custom::RSAKey
+    Properties:
+      Name: /bastion/default/private-key
+      RefreshOnUpdate: false
+      ServiceToken: !GetAtt CFNSecretProvider.Arn
+
+  KeyPair:
+    Type: Custom::KeyPair
+    DependsOn: PrivateKey
+    Properties:
+      Name: BastionKeyPair
+      PublicKeyMaterial: !GetAtt 'PrivateKey.PublicKey'
+      ServiceToken: !GetAtt CFNSecretProvider.Arn
+
+  CFNSecretProviderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+          Condition: {}
+      Path: /
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+      - PolicyName: CFNCustomSecretProviderPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - iam:CreateAccessKey
+            - iam:UpdateAccessKey
+            - iam:DeleteAccessKey
+            - ssm:PutParameter
+            - ssm:GetParameter
+            - ssm:DeleteParameter
+            - ec2:ImportKeyPair
+            - ec2:DeleteKeyPair
+            Resource:
+            - '*'
+          - Effect: Allow
+            Action:
+            - kms:Encrypt
+            - kms:Decrypt
+            Resource:
+            - '*'
+
+  CFNSecretProvider:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        S3Bucket: !Sub 'binxio-public-${AWS::Region}'
+        S3Key: lambdas/cfn-secret-provider-0.13.2.zip
+      Handler: secrets.handler
+      MemorySize: 128
+      Role: !GetAtt 'CFNSecretProviderRole.Arn'
+      Runtime: python3.6
+      Timeout: 300
+
+  CFNSecretProviderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${CFNSecretProvider}'
+      RetentionInDays: 30
+
+Outputs:
+  VpcId:
+    Description: The ID of the Vpc
+    Value: !Ref VPC
+  PublicSubnetIds:
+    Description: The public subnet Id
+    Value: !Ref PublicSubnet
+  PrivateSubnetIds:
+    Description: The private subnet Id
+    Value: !Ref PrivateSubnet
+  PublicKey:
+    Description: The public key of the bastion host
+    Value: !GetAtt 'PrivateKey.PublicKey'
+  BastionHostPublicIp:
+    Value: !GetAtt BastionHost.PublicIp
+  BastionHostPublicDnsName:
+    Value: !GetAtt BastionHost.PublicDnsName
